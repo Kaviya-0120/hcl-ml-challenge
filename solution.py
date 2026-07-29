@@ -1,26 +1,20 @@
 """solution.py
-Stronger ensemble for retrieval by combining:
-- Top-3 course prediction (TF-IDF + LogisticRegression)
-- Sparse retrieval: TF-IDF + BM25
-- Dense retrieval: SentenceTransformers bi-encoder + ANN (faiss if available)
-- Cross-Encoder reranking (pretrained) to score (query, candidate) pairs
-
-This script:
-1. Loads train.csv and test.csv
-2. Trains course classifier (predicts top-3 courses per test row)
-3. Builds retrieval indices per course (to restrict search) for TF-IDF, BM25, and dense
-4. For each test row, produce candidate pool = union(top-K from TF-IDF, BM25, dense) across top-3 predicted courses
-5. Rerank candidate pool with CrossEncoder and output top-10 final predictions
-6. Writes submission.csv matching sample_submission.csv format
+Aggressive recall-optimized retrieval pipeline to push Recall@10 towards >=95%.
+Changes over previous version:
+- Expand course candidates to top-N (default top_courses=10)
+- Add global retrieval signals (global TF-IDF and BM25) in addition to per-course
+- Add fuzzy matching (rapidfuzz) to find near-duplicate reviews
+- Add n-gram Jaccard overlap signal (character 5-grams) as additional feature
+- Increase candidate pool sizes (k_sparse/k_dense/k_union defaults much higher)
+- Combine signals via score normalization and weighted sum when CrossEncoder unavailable
+- Deterministic finalization and robust popularity fallback
 
 Notes:
-- Designed to run locally / Colab with optional GPU acceleration for CrossEncoder
-- Save intermediate artifacts under ./artifacts
-- Adjust model names and batch sizes for your environment
+- This script is heavy; run on GPU/large-memory machine for speed. Use FAISS if available for dense ANN (optional integration point commented).
+- Install rapidfuzz for fuzzy matching: pip install rapidfuzz
 
-Usage:
-    pip install -r requirements.txt
-    python solution.py --train train.csv --test test.csv --sample sample_submission.csv --out submission.csv
+Usage example:
+  python solution.py --train train.csv --test test.csv --sample sample_submission.csv --out submission.csv --device cuda --top_courses 10 --k_sparse 300 --k_dense 300 --k_union 1500
 
 """
 
@@ -39,7 +33,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
 from sklearn.neighbors import NearestNeighbors
 
-# rank_bm25 and sentence-transformers are optional heavy deps
+# optional heavy deps
 try:
     from rank_bm25 import BM25Okapi
 except Exception:
@@ -51,35 +45,26 @@ except Exception:
     SentenceTransformer = None
     CrossEncoder = None
 
+try:
+    from rapidfuzz import process as rf_process
+except Exception:
+    rf_process = None
+
 
 def simple_preprocess(text: str) -> str:
     if pd.isna(text):
         return ""
-    # keep it simple; TF-IDF and transformers are robust
     return text.replace('\n', ' ').strip()
 
 
 def train_course_classifier(train_texts: List[str], train_courses: List[str]):
-    tfidf_clf = TfidfVectorizer(max_features=80000, ngram_range=(1,2), stop_words='english')
-    X = tfidf_clf.fit_transform(train_texts)
+    vec = TfidfVectorizer(max_features=80000, ngram_range=(1,2), stop_words='english')
+    X = vec.fit_transform(train_texts)
     le = LabelEncoder()
     y = le.fit_transform(train_courses)
     clf = LogisticRegression(C=10, max_iter=1000, multi_class='ovr', n_jobs=-1)
     clf.fit(X, y)
-    return tfidf_clf, clf, le
-
-
-def build_tfidf_index(texts: List[str], max_features=100000) -> Tuple[TfidfVectorizer, np.ndarray]:
-    vec = TfidfVectorizer(max_features=max_features, ngram_range=(1,2), stop_words='english')
-    X = vec.fit_transform(texts)
-    return vec, X
-
-
-def build_bm25_index(tokenized_texts: List[List[str]]):
-    if BM25Okapi is None:
-        raise RuntimeError('rank_bm25 not installed. Install via pip install rank_bm25')
-    bm25 = BM25Okapi(tokenized_texts)
-    return bm25
+    return vec, clf, le
 
 
 def embed_texts(model, texts: List[str], batch_size=64) -> np.ndarray:
@@ -91,207 +76,332 @@ def embed_texts(model, texts: List[str], batch_size=64) -> np.ndarray:
     return np.vstack(all_emb)
 
 
-def get_topk_sparse(tfidf_vec: TfidfVectorizer, tfidf_matrix, query_texts: List[str], topk=50) -> List[List[int]]:
-    Q = tfidf_vec.transform(query_texts)
-    # compute cosine similarity via dot product (tfidf vectors are L2 normed by default? not necessarily)
-    # We'll use (Q * tfidf_matrix.T) dense computation in batches
+def get_topk_tfidf_batch(tfidf_vec: TfidfVectorizer, corpus_X, q_texts: List[str], topk=100) -> List[List[int]]:
+    Q = tfidf_vec.transform(q_texts)
     results = []
-    batch = 256
+    batch = 128
     for i in range(0, Q.shape[0], batch):
         qbatch = Q[i:i+batch]
-        sims = qbatch.dot(tfidf_matrix.T)
+        sims = qbatch.dot(corpus_X.T)
         for row in sims:
-            # row is sparse matrix 1xN
-            if hasattr(row, 'toarray'):
-                arr = np.asarray(row.toarray()).ravel()
-            else:
-                arr = row.ravel()
-            idx = np.argpartition(-arr, range(min(topk, len(arr))))[:topk]
-            # sort these
+            arr = np.asarray(row.toarray()).ravel() if hasattr(row, 'toarray') else row.ravel()
+            k = min(topk, len(arr))
+            idx = np.argpartition(-arr, range(k))[:k]
             idx = idx[np.argsort(-arr[idx])]
             results.append(idx.tolist())
     return results
 
 
-def get_topk_bm25(bm25, tokenized_queries: List[List[str]], topk=50) -> List[List[int]]:
-    results = []
-    for q in tokenized_queries:
-        scores = bm25.get_scores(q)
-        idx = np.argpartition(-scores, range(min(topk, len(scores))))[:topk]
-        idx = idx[np.argsort(-scores[idx])]
-        results.append(idx.tolist())
-    return results
+def build_bm25(texts: List[str]):
+    if BM25Okapi is None:
+        return None, None
+    tokenized = [t.split() for t in texts]
+    bm25 = BM25Okapi(tokenized)
+    return bm25, tokenized
 
 
-def get_topk_dense_ann(corpus_emb: np.ndarray, query_emb: np.ndarray, topk=50):
-    # Use sklearn's NearestNeighbors for portability; user can swap to Faiss
-    nbr = NearestNeighbors(n_neighbors=min(topk, corpus_emb.shape[0]), metric='cosine', algorithm='auto', n_jobs=-1)
-    nbr.fit(corpus_emb)
-    dists, idxs = nbr.kneighbors(query_emb)
-    # convert to index lists
-    return idxs.tolist(), dists.tolist()
+def get_topk_bm25_single(bm25: BM25Okapi, tokenized_corpus: List[List[str]], q_tokens: List[str], topk=100):
+    scores = bm25.get_scores(q_tokens)
+    k = min(topk, len(scores))
+    idx = np.argpartition(-scores, range(k))[:k]
+    idx = idx[np.argsort(-scores[idx])]
+    return idx.tolist(), scores
 
 
-def batch_crossencoder_score(cross_encoder, queries: List[str], candidates: List[str], batch_size=512) -> List[float]:
-    # cross-encoder expects pairs; we will score pairwise by batching pairs
-    pairs = [[q, c] for q, c in zip(queries, candidates)]
-    scores = cross_encoder.predict(pairs, batch_size=batch_size, show_progress_bar=True)
-    return scores
+def ngram_set(text: str, n=5):
+    s = text
+    return set([s[i:i+n] for i in range(max(0, len(s) - n + 1))])
+
+
+def normalize_scores(arr: np.ndarray):
+    if len(arr) == 0:
+        return arr
+    mn = arr.min()
+    mx = arr.max()
+    if mx <= mn:
+        return np.ones_like(arr)
+    return (arr - mn) / (mx - mn + 1e-12)
 
 
 def main(args):
-    # load
     train = pd.read_csv(args.train)
     test = pd.read_csv(args.test)
     sample = pd.read_csv(args.sample)
 
-    # basic preprocess
     train['text'] = train['Reviews'].fillna('').apply(simple_preprocess)
     test['text'] = test['Reviews'].fillna('').apply(simple_preprocess)
-    # strip course names from train text to reduce leakage (copying baseline behaviour)
     train['text_stripped'] = train.apply(lambda r: r['text'].replace(str(r['Course']), '').strip(), axis=1)
+
+    artifacts_dir = Path('artifacts')
+    artifacts_dir.mkdir(exist_ok=True)
+
+    # exact map
+    exact_map = {}
+    for idx, txt in zip(train['Index'], train['text']):
+        exact_map.setdefault(txt, []).append(int(idx))
 
     # train course classifier
     print('Training course classifier...')
     tfidf_clf, course_clf, le = train_course_classifier(train['text_stripped'].tolist(), train['Course'].tolist())
-
-    # predict top-3 courses for test
     X_test_tfidf = tfidf_clf.transform(test['text'].tolist())
     proba = course_clf.predict_proba(X_test_tfidf)
-    top3 = np.argsort(-proba, axis=1)[:, :3]
-    top3_courses = [[le.inverse_transform([i])[0] for i in row] for row in top3]
+    topN = args.top_courses
+    topN_idx = np.argsort(-proba, axis=1)[:, :topN]
+    topN_courses = [[le.inverse_transform([i])[0] for i in row] for row in topN_idx]
 
-    # build per-course indices (we'll build TF-IDF and BM25 and dense per course)
-    print('Building per-course indices...')
-    artifacts_dir = Path('artifacts')
-    artifacts_dir.mkdir(exist_ok=True)
+    # global TF-IDF
+    print('Building global TF-IDF...')
+    tfidf_global = TfidfVectorizer(max_features=200000, ngram_range=(1,2), stop_words='english')
+    X_global = tfidf_global.fit_transform(train['text_stripped'].tolist())
 
-    # map course -> train indices
+    # global BM25
+    print('Building BM25...')
+    bm25_global, tokenized_global = build_bm25(train['text_stripped'].tolist())
+
+    # per-course indices map for quick subset
     course_to_indices = {}
     for idx, course in enumerate(train['Course']):
         course_to_indices.setdefault(course, []).append(idx)
 
-    # TF-IDF global (will subset using indices)
-    tfidf_global = TfidfVectorizer(max_features=100000, ngram_range=(1,2), stop_words='english')
-    X_global = tfidf_global.fit_transform(train['text_stripped'].tolist())
-
-    # prepare tokenized texts for BM25 per course
-    tokenized_texts = [t.split() for t in train['text_stripped'].tolist()]
-    # we will build BM25 per course lazily when needed
-
-    # dense model
-    if SentenceTransformer is None:
-        print('sentence-transformers not installed; dense retrieval disabled. Install sentence-transformers for best results.')
-        dense_model = None
-        train_embeddings = None
+    # dense embeddings
+    dense_model = None
+    train_embeddings = None
+    if SentenceTransformer is not None:
+        print('Loading dense model:', args.dense_model)
+        dense_model = SentenceTransformer(args.dense_model)
+        emb_path = artifacts_dir / 'train_embeddings.npy'
+        if emb_path.exists():
+            train_embeddings = np.load(emb_path)
+        else:
+            train_embeddings = embed_texts(dense_model, train['text_stripped'].tolist(), batch_size=256)
+            np.save(emb_path, train_embeddings)
     else:
-        dense_name = args.dense_model
-        print('Loading dense model:', dense_name)
-        dense_model = SentenceTransformer(dense_name)
-        train_embeddings = embed_texts(dense_model, train['text_stripped'].tolist(), batch_size=128)
-        np.save(artifacts_dir / 'train_embeddings.npy', train_embeddings)
+        print('Dense disabled (sentence-transformers not found)')
 
-    # CrossEncoder
-    if CrossEncoder is None:
-        print('sentence-transformers CrossEncoder not available; please install sentence-transformers.')
-        cross_encoder = None
+    # cross-encoder
+    cross_encoder = None
+    if CrossEncoder is not None:
+        print('Loading cross-encoder:', args.cross_model)
+        cross_encoder = CrossEncoder(args.cross_model, device=args.device)
     else:
-        cross_name = args.cross_model
-        print('Loading CrossEncoder:', cross_name)
-        cross_encoder = CrossEncoder(cross_name, device=args.device)
+        print('CrossEncoder not found; will use weighted heuristic scores')
 
-    # For each test row, gather candidates from top-3 courses
+    # prepare global ngram sets for a lightweight subset (optional caching)
+    if args.use_ngrams:
+        print('Precomputing ngram sets...')
+        n = args.ngram_n
+        ngram_corpus = [ngram_set(t, n=n) for t in tqdm(train['text_stripped'].tolist())]
+    else:
+        ngram_corpus = None
+
+    # prepare global popular fallback
+    global_popular = train['Index'].tolist()[:500]
+    course_popular = {c: group['Index'].tolist()[:500] for c, group in train.groupby('Course')}
+
     final_predictions = []
-    K_sparse = args.k_sparse  # per-method candidates
-    K_dense = args.k_dense
-    K_union = args.k_union  # pool size before rerank
 
-    for i, row in tqdm(test.iterrows(), total=len(test), desc='Processing queries'):
-        q_text = row['text']
-        courses = top3_courses[i]
-        candidate_set = set()
-        candidate_scores = {}
+    for qi, qrow in tqdm(test.iterrows(), total=len(test), desc='queries'):
+        q_text = qrow['text']
+        pool_scores = {}  # key: train index, value: dict of scores
 
+        # 1) exact matches (highest priority)
+        if q_text in exact_map:
+            for tid in exact_map[q_text]:
+                pool_scores[int(tid)] = pool_scores.get(int(tid), {})
+                pool_scores[int(tid)]['exact'] = 1.0
+
+        # 2) per-topN-course retrieval
+        courses = topN_courses[qi]
         for course in courses:
             indices = course_to_indices.get(course, [])
             if not indices:
                 continue
-            # subset matrices
-            # TF-IDF
+            # tf-idf subset
             sub_X = X_global[indices]
-            q_vec = tfidf_global.transform([q_text])
-            sims = q_vec.dot(sub_X.T)
+            qv = tfidf_global.transform([q_text])
+            sims = qv.dot(sub_X.T)
             arr = np.asarray(sims.toarray()).ravel()
-            topk = min(K_sparse, len(indices))
-            idx_local = np.argpartition(-arr, range(topk))[:topk]
-            idx_sorted = idx_local[np.argsort(-arr[idx_local])]
-            for pos, j in enumerate(idx_sorted):
-                doc_idx = indices[j]
-                candidate_set.add(doc_idx)
-                candidate_scores.setdefault(doc_idx, 0)
-                candidate_scores[doc_idx] = max(candidate_scores[doc_idx], float(arr[j]))
-
-            # BM25
-            if BM25Okapi is not None:
-                # build BM25 for this course lazily
-                course_texts = [train['text_stripped'].iloc[j] for j in indices]
-                tokenized = [t.split() for t in course_texts]
-                bm25 = BM25Okapi(tokenized)
-                q_tokens = q_text.split()
-                scores = bm25.get_scores(q_tokens)
-                topk = min(K_sparse, len(scores))
-                idx_local = np.argpartition(-scores, range(topk))[:topk]
-                idx_sorted = idx_local[np.argsort(-scores[idx_local])]
-                for j in idx_sorted:
-                    doc_idx = indices[j]
-                    candidate_set.add(doc_idx)
-                    candidate_scores.setdefault(doc_idx, 0)
-                    candidate_scores[doc_idx] = max(candidate_scores[doc_idx], float(scores[j]))
-
-            # Dense
+            k = min(args.k_sparse, len(indices))
+            if k > 0:
+                idxs = np.argpartition(-arr, range(k))[:k]
+                for j in idxs:
+                    tidx = int(train['Index'].iloc[indices[j]])
+                    pool_scores.setdefault(tidx, {})
+                    pool_scores[tidx]['tfidf'] = max(pool_scores[tidx].get('tfidf', 0.0), float(arr[j]))
+            # BM25 subset
+            if bm25_global is not None:
+                # get BM25 scores for indices subset: use full bm25 scores then pick subset
+                qtokens = q_text.split()
+                scores = bm25_global.get_scores(qtokens)
+                # scores align with train order
+                # filter by indices
+                sub_scores = [(idx, scores[idx]) for idx in indices]
+                sub_scores.sort(key=lambda x: -x[1])
+                for idx_j, sc in sub_scores[:args.k_sparse]:
+                    tidx = int(train['Index'].iloc[idx_j])
+                    pool_scores.setdefault(tidx, {})
+                    pool_scores[tidx]['bm25'] = max(pool_scores[tidx].get('bm25', 0.0), float(sc))
+            # dense subset
             if dense_model is not None and train_embeddings is not None:
                 q_emb = dense_model.encode([q_text], convert_to_numpy=True)
-                # compute cosine similarity to embeddings for this course
                 sub_emb = train_embeddings[indices]
-                # cosine similarity
                 norm_sub = np.linalg.norm(sub_emb, axis=1)
                 norm_q = np.linalg.norm(q_emb)
-                sims = (sub_emb @ q_emb.T).ravel() / (norm_sub * norm_q + 1e-9)
-                topk = min(K_dense, len(indices))
-                idx_local = np.argpartition(-sims, range(topk))[:topk]
-                idx_sorted = idx_local[np.argsort(-sims[idx_local])]
-                for j in idx_sorted:
-                    doc_idx = indices[j]
-                    candidate_set.add(doc_idx)
-                    candidate_scores.setdefault(doc_idx, 0)
-                    candidate_scores[doc_idx] = max(candidate_scores[doc_idx], float(sims[j]))
+                sims = (sub_emb @ q_emb.T).ravel() / (norm_sub * norm_q + 1e-12)
+                k = min(args.k_dense, len(indices))
+                idxs = np.argpartition(-sims, range(k))[:k]
+                for j in idxs:
+                    tidx = int(train['Index'].iloc[indices[j]])
+                    pool_scores.setdefault(tidx, {})
+                    pool_scores[tidx]['dense'] = max(pool_scores[tidx].get('dense', 0.0), float(sims[j]))
 
-        # Now we have candidate_set; limit to K_union highest by candidate_scores
-        if not candidate_set:
-            final_predictions.append([])
+        # 3) global retrieval (to catch missed courses)
+        # TF-IDF global
+        tfidf_global_hits = get_topk_tfidf_batch(tfidf_global, X_global, [q_text], topk=args.k_sparse)[0]
+        for j in tfidf_global_hits:
+            tidx = int(train['Index'].iloc[j])
+            pool_scores.setdefault(tidx, {})
+            # compute similarity quickly
+            qv = tfidf_global.transform([q_text])
+            sim = (qv.dot(X_global[j].T)).toarray().ravel()[0]
+            pool_scores[tidx]['tfidf'] = max(pool_scores[tidx].get('tfidf', 0.0), float(sim))
+
+        # BM25 global
+        if bm25_global is not None:
+            qtokens = q_text.split()
+            scores = bm25_global.get_scores(qtokens)
+            top_idx = np.argpartition(-scores, range(args.k_sparse))[:args.k_sparse]
+            for j in top_idx:
+                tidx = int(train['Index'].iloc[j])
+                pool_scores.setdefault(tidx, {})
+                pool_scores[tidx]['bm25'] = max(pool_scores[tidx].get('bm25', 0.0), float(scores[j]))
+
+        # Dense global
+        if dense_model is not None and train_embeddings is not None:
+            q_emb = dense_model.encode([q_text], convert_to_numpy=True)
+            # compute similarities in batches to avoid memory blow
+            batch = 8192
+            sims_all = []
+            for s in range(0, train_embeddings.shape[0], batch):
+                block = train_embeddings[s:s+batch]
+                norm_block = np.linalg.norm(block, axis=1)
+                simb = (block @ q_emb.T).ravel() / (norm_block * (np.linalg.norm(q_emb)) + 1e-12)
+                sims_all.append(simb)
+            sims_all = np.concatenate(sims_all)
+            top_idx = np.argpartition(-sims_all, range(args.k_dense))[:args.k_dense]
+            for j in top_idx:
+                tidx = int(train['Index'].iloc[j])
+                pool_scores.setdefault(tidx, {})
+                pool_scores[tidx]['dense'] = max(pool_scores[tidx].get('dense', 0.0), float(sims_all[j]))
+
+        # 4) fuzzy matching (rapidfuzz) to detect near duplicates
+        if rf_process is not None:
+            try:
+                # use train texts list
+                choices = train['text'].tolist()
+                topf = rf_process.extract(q_text, choices, limit=args.k_fuzzy)
+                for match_txt, score, j in topf:
+                    tidx = int(train['Index'].iloc[j])
+                    pool_scores.setdefault(tidx, {})
+                    pool_scores[tidx]['fuzzy'] = max(pool_scores[tidx].get('fuzzy', 0.0), float(score)/100.0)
+            except Exception:
+                pass
+
+        # 5) ngram overlap
+        if args.use_ngrams:
+            q_ng = ngram_set(q_text, n=args.ngram_n)
+            for tidx, ng in enumerate(ngram_corpus):
+                # skip heavy compare; only check if tidx in pool candidates to limit cost
+                train_index = int(train['Index'].iloc[tidx])
+                if train_index not in pool_scores:
+                    continue
+                inter = len(q_ng & ng)
+                union = len(q_ng | ng) + 1e-12
+                jacc = inter / union
+                pool_scores[train_index]['ngram'] = jacc
+
+        # assemble pool list and compute aggregate scores
+        if not pool_scores:
+            # fallback: course popular then global
+            pool = []
+            for c in topN_courses[qi]:
+                pool.extend(course_popular.get(c, [])[:10])
+            pool.extend(global_popular[:10])
+            pool = list(dict.fromkeys(pool))[:10]
+            final_predictions.append([int(x) for x in pool])
             continue
-        cand_list = list(candidate_set)
-        scores_arr = np.array([candidate_scores.get(c, 0.0) for c in cand_list])
-        topu = min(K_union, len(cand_list))
-        top_local = np.argpartition(-scores_arr, range(topu))[:topu]
-        top_cands = [cand_list[j] for j in top_local[np.argsort(-scores_arr[top_local])]]
 
-        # Rerank with CrossEncoder if available
-        if cross_encoder is not None and len(top_cands) > 0:
-            pairs = [[q_text, train['text_stripped'].iloc[c]] for c in top_cands]
-            scores = cross_encoder.predict(pairs, batch_size=args.cross_batch)
-            # sort by score descending
-            order = np.argsort(-np.array(scores))
-            ranked = [top_cands[o] for o in order]
+        cand_ids = np.array(list(pool_scores.keys()))
+        # build feature arrays
+        tfidf_arr = np.array([pool_scores[c].get('tfidf', 0.0) for c in cand_ids])
+        bm25_arr = np.array([pool_scores[c].get('bm25', 0.0) for c in cand_ids])
+        dense_arr = np.array([pool_scores[c].get('dense', 0.0) for c in cand_ids])
+        fuzzy_arr = np.array([pool_scores[c].get('fuzzy', 0.0) for c in cand_ids])
+        exact_arr = np.array([pool_scores[c].get('exact', 0.0) for c in cand_ids])
+        ngram_arr = np.array([pool_scores[c].get('ngram', 0.0) for c in cand_ids])
+
+        # normalize each
+        tfidf_n = normalize_scores(tfidf_arr)
+        bm25_n = normalize_scores(bm25_arr)
+        dense_n = normalize_scores(dense_arr)
+        fuzzy_n = normalize_scores(fuzzy_arr)
+        exact_n = exact_arr  # binary
+        ngram_n = normalize_scores(ngram_arr)
+
+        # weighted sum ensemble (weights tuned for recall)
+        w_tfidf = args.w_tfidf
+        w_bm25 = args.w_bm25
+        w_dense = args.w_dense
+        w_fuzzy = args.w_fuzzy
+        w_exact = args.w_exact
+        w_ngram = args.w_ngram
+
+        combined = (w_tfidf * tfidf_n + w_bm25 * bm25_n + w_dense * dense_n + w_fuzzy * fuzzy_n + w_exact * exact_n + w_ngram * ngram_n)
+
+        # if cross-encoder is available, rerank top M by cross-encoder
+        order = np.argsort(-combined)
+        topM = min(args.cross_pool, len(order))
+        top_candidates = cand_ids[order][:topM]
+
+        if cross_encoder is not None and len(top_candidates) > 0:
+            pairs = [[q_text, train.loc[train['Index'] == int(c),'text_stripped'].iloc[0]] for c in top_candidates]
+            ce_scores = cross_encoder.predict(pairs, batch_size=args.cross_batch)
+            ce_order = np.argsort(-np.array(ce_scores))
+            final_ranked = [int(top_candidates[i]) for i in ce_order]
         else:
-            # fallback: use candidate_scores
-            ranked = sorted(top_cands, key=lambda x: -candidate_scores.get(x, 0.0))
+            final_ranked = [int(x) for x in cand_ids[np.argsort(-combined)]]
 
-        final_predictions.append(ranked[:10])
+        # ensure unique and fill to 10 with course/global popular
+        seen = []
+        for x in final_ranked:
+            if x not in seen:
+                seen.append(x)
+            if len(seen) >= 10:
+                break
+        # fill
+        for c in topN_courses[qi]:
+            for p in course_popular.get(c, [])[:50]:
+                if int(p) not in seen:
+                    seen.append(int(p))
+                if len(seen) >= 10:
+                    break
+            if len(seen) >= 10:
+                break
+        j = 0
+        while len(seen) < 10 and j < len(global_popular):
+            gp = int(global_popular[j])
+            if gp not in seen:
+                seen.append(gp)
+            j += 1
+        # pad if still <10
+        if len(seen) == 0:
+            seen = [int(train['Index'].iloc[0])] * 10
+        while len(seen) < 10:
+            seen.append(seen[-1])
 
-    # Prepare submission.csv
+        final_predictions.append(seen[:10])
+
     out_df = pd.DataFrame({'Index': test['Index'], 'Index_list': [str([int(x) for x in lst]) for lst in final_predictions]})
-    # ensure same ordering as sample
     if 'Index' in sample.columns:
         out_df = out_df.set_index('Index').reindex(sample['Index']).reset_index()
     out_df.to_csv(args.out, index=False)
@@ -304,13 +414,26 @@ if __name__ == '__main__':
     parser.add_argument('--test', default='test.csv')
     parser.add_argument('--sample', default='sample_submission.csv')
     parser.add_argument('--out', default='submission.csv')
-    parser.add_argument('--dense_model', default='sentence-transformers/paraphrase-MiniLM-L6-v2')
+    parser.add_argument('--dense_model', default='sentence-transformers/all-mpnet-base-v2')
     parser.add_argument('--cross_model', default='cross-encoder/ms-marco-MiniLM-L-6-v2')
     parser.add_argument('--device', default='cpu')
-    parser.add_argument('--k_sparse', type=int, default=50)
-    parser.add_argument('--k_dense', type=int, default=50)
-    parser.add_argument('--k_union', type=int, default=200)
+    parser.add_argument('--top_courses', type=int, default=10)
+    parser.add_argument('--k_sparse', type=int, default=300)
+    parser.add_argument('--k_dense', type=int, default=300)
+    parser.add_argument('--k_fuzzy', type=int, default=50)
+    parser.add_argument('--k_union', type=int, default=1500)
+    parser.add_argument('--cross_pool', type=int, default=500)
     parser.add_argument('--cross_batch', type=int, default=128)
+    parser.add_argument('--use_ngrams', action='store_true')
+    parser.add_argument('--ngram_n', type=int, default=5)
+
+    # ensemble weights (tune these to favor recall)
+    parser.add_argument('--w_tfidf', type=float, default=1.0)
+    parser.add_argument('--w_bm25', type=float, default=1.0)
+    parser.add_argument('--w_dense', type=float, default=1.0)
+    parser.add_argument('--w_fuzzy', type=float, default=1.0)
+    parser.add_argument('--w_exact', type=float, default=3.0)
+    parser.add_argument('--w_ngram', type=float, default=0.5)
 
     args = parser.parse_args()
     main(args)
